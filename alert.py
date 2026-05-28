@@ -51,7 +51,7 @@ MAX_RETRIES    = 3
 RETRY_BACKOFF  = 5     # seconds, multiplied by attempt number
 DISCORD_PAUSE  = 0.6
 USER_AGENT     = "warera-bunker-bot/1.0"
-BOT_USERNAME   = "bunker-bot"   # overrides whatever the Discord webhook is named
+BOT_USERNAME   = "Bunksby-Bunkerbot"   # overrides whatever the Discord webhook is named
 RUNS_KEEP      = 100   # how many recent runs to retain in runs.json
 
 # If the heartbeat sees the last successful alert run was older than this,
