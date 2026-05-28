@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write           # to commit state.json back
+  contents: write
 
 jobs:
   check:
@@ -23,12 +23,12 @@ jobs:
         env:
           DISCORD_BUNKER_WEBHOOK_URL: ${{ secrets.DISCORD_BUNKER_WEBHOOK_URL }}
         run: python alert.py
-      - name: Commit updated state.json
+      - name: Commit updated state
         run: |
           git config user.name "bunker-bot"
           git config user.email "bunker-bot@users.noreply.github.com"
-          if [[ -n "$(git status --porcelain state.json)" ]]; then
-            git add state.json
+          if [[ -n "$(git status --porcelain state.json runs.json)" ]]; then
+            git add state.json runs.json
             git commit -m "Update bunker state ($(date -u +%FT%TZ))"
             git push
           else

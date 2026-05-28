@@ -1,0 +1,22 @@
+name: Bunker bot heartbeat
+
+on:
+  schedule:
+    - cron: "0 12 * * *"   # daily at 12:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run heartbeat
+        env:
+          DISCORD_BUNKER_WEBHOOK_URL: ${{ secrets.DISCORD_BUNKER_WEBHOOK_URL }}
+        run: python alert.py --heartbeat
