@@ -51,6 +51,7 @@ MAX_RETRIES    = 3
 RETRY_BACKOFF  = 5     # seconds, multiplied by attempt number
 DISCORD_PAUSE  = 0.6
 USER_AGENT     = "warera-bunker-bot/1.0"
+BOT_USERNAME   = "bunker-bot"   # overrides whatever the Discord webhook is named
 RUNS_KEEP      = 100   # how many recent runs to retain in runs.json
 
 # If the heartbeat sees the last successful alert run was older than this,
@@ -141,11 +142,20 @@ def parse_iso(s):
         return None
 
 
+# War Era uses a few country codes that aren't valid ISO 3166-1 alpha-2,
+# so the regional-indicator emoji renders blank. Translate here before
+# building the flag. Display name still uses the game's code (e.g. "uk").
+FLAG_CODE_ALIASES = {
+    "uk": "gb",  # United Kingdom is GB in ISO 3166
+}
+
+
 def flag(cc):
     """2-letter country code to flag emoji."""
     if not cc or len(cc) != 2 or not cc.isalpha():
         return "🏳️"
-    return "".join(chr(0x1F1E6 + ord(ch) - ord('a')) for ch in cc.lower())
+    code = FLAG_CODE_ALIASES.get(cc.lower(), cc.lower())
+    return "".join(chr(0x1F1E6 + ord(ch) - ord('a')) for ch in code)
 
 
 def country_label(cc):
@@ -459,7 +469,11 @@ def post_to_discord(webhook_url, embeds):
     chunks = [embeds[i:i + 10] for i in range(0, len(embeds), 10)]
     for idx, chunk in enumerate(chunks, 1):
         payload = json.dumps(
-            _strip_none({"embeds": chunk, "allowed_mentions": {"parse": []}})
+            _strip_none({
+                "username": BOT_USERNAME,
+                "embeds": chunk,
+                "allowed_mentions": {"parse": []},
+            })
         ).encode("utf-8")
         sent = False
 
@@ -503,6 +517,7 @@ def post_text_message(webhook_url, text):
     if not webhook_url:
         return False
     payload = json.dumps({
+        "username": BOT_USERNAME,
         "content": text,
         "allowed_mentions": {"parse": []},
     }).encode("utf-8")
