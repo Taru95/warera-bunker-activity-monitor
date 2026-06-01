@@ -27,6 +27,13 @@ battle damage). The alert states the change and lets humans investigate.
 State files (committed back by the workflow):
   state.json  per-region snapshot, compared against on next run
   runs.json   rolling log of per-run stats, used by the heartbeat
+
+NOTE ON OWNERSHIP FIELDS:
+  region.countryCode    = the CORE / original owner's code (never changes)
+  region.initialCountry = the CORE owner's id (matches countryCode)
+  region.country        = the CURRENT controller's id (changes on conquest)
+  The current controller's CODE is resolved by looking up `country` in a
+  map built from initialCountry -> countryCode (see build_country_id_to_code).
 """
 
 import argparse
@@ -236,15 +243,23 @@ def extract_active_battle_id(region):
 
 
 def build_country_id_to_code(regions):
-    """{country_id: country_code} reverse map, derived from the regions data."""
+    """
+    {country_id: country_code}, derived from CORE ownership.
+
+    A region's `countryCode` is its CORE/original owner's code, and
+    `initialCountry` is that same owner's id — so this pair is always
+    consistent regardless of who currently occupies the region. Building
+    the map off `country` (the *current* controller) would mislabel every
+    occupied region's id with the core's code.
+    """
     out = {}
     for region in regions.values():
         if not isinstance(region, dict):
             continue
-        cid = region.get("country")
-        ccode = region.get("countryCode")
-        if cid and ccode:
-            out[cid] = ccode.lower()
+        core_id   = region.get("initialCountry")
+        core_code = region.get("countryCode")
+        if core_id and core_code:
+            out[core_id] = core_code.lower()
     return out
 
 
@@ -254,15 +269,24 @@ def build_current_state(regions, country_id_to_code):
     for rid, region in regions.items():
         if not isinstance(region, dict):
             continue
-        country_id         = region.get("country")
-        initial_country_id = region.get("initialCountry")
+        country_id         = region.get("country")          # CURRENT controller (id)
+        initial_country_id = region.get("initialCountry")    # CORE / original owner (id)
+
+        # `countryCode` is the CORE owner's code, NOT the current controller's.
+        core_code       = (region.get("countryCode") or "").lower() or None
+        # Resolve the current controller's code via the id->code map.
+        # Fall back to the core code if the occupier holds no core region of
+        # its own in this snapshot (rare); worst case reads as core owner,
+        # i.e. the old behaviour, never a crash.
+        controller_code = country_id_to_code.get(country_id) or core_code
+
         out[rid] = {
             "name":                  region.get("name"),
             "code":                  region.get("code"),
-            "country_code":          (region.get("countryCode") or "").lower() or None,
+            "country_code":          controller_code,     # who controls it NOW
             "country_id":            country_id,
             "initial_country_id":    initial_country_id,
-            "initial_country_code":  country_id_to_code.get(initial_country_id),
+            "initial_country_code":  core_code,            # who it belongs to
             "active_battle_id":      extract_active_battle_id(region),
             "bunker":                extract_bunker_state(region),
             "observed_at":           now,
@@ -287,7 +311,7 @@ def detect_transitions(prev, curr):
         if p is None or c is None:
             continue  # first observation or vanished
 
-        # Ownership flip
+        # Ownership flip (now compares CURRENT controllers, not core owners)
         p_cc = p.get("country_code")
         c_cc = c.get("country_code")
         if p_cc and c_cc and p_cc != c_cc:
@@ -388,7 +412,7 @@ def format_event_embed(event):
         kind, ("⚪", "Region change", COLOR_GRAY, "")
     )
 
-    origin_cc  = origin_country_code(region_code)
+    origin_cc  = origin_country_code(region_code)   # core owner, from region code prefix
     origin_tag = f" ({origin_cc.upper()})" if origin_cc else ""
 
     p_run      = event["prev_bunker"].get("running_level")
@@ -403,8 +427,12 @@ def format_event_embed(event):
             f"flipped from {country_with_flag(prev_cc)} to {country_with_flag(curr_cc)}"
         )
     else:
-        controller = country_with_flag(curr_cc) if curr_cc else "🏳️ **Unknown**"
-        header_line = f"**{region_name}**{origin_tag}  ·  Controlled by {controller}"
+        if not curr_cc:
+            header_line = f"**{region_name}**{origin_tag}  ·  Controlled by 🏳️ **Unknown**"
+        else:
+            # "Occupied by" when the holder isn't the core owner; else "Controlled by".
+            verb = "Occupied by" if (origin_cc and curr_cc != origin_cc) else "Controlled by"
+            header_line = f"**{region_name}**{origin_tag}  ·  {verb} {country_with_flag(curr_cc)}"
 
     # ── Detail line: what specifically changed ──
     if kind == "came_online":
