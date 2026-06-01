@@ -20,6 +20,7 @@ Events detected:
   construction_started  bunker construction kicked off
   battle_started        a battle began on this region
   battle_ended          the active battle finished
+  bunker_activating     bunker is pending and will activate at willBeActiveAt
 
 We cannot tell *why* a bunker transitioned (oil exhausted, manual disable,
 battle damage). The alert states the change and lets humans investigate.
@@ -34,6 +35,14 @@ NOTE ON OWNERSHIP FIELDS:
   region.country        = the CURRENT controller's id (changes on conquest)
   The current controller's CODE is resolved by looking up `country` in a
   map built from initialCountry -> countryCode (see build_country_id_to_code).
+
+NOTE ON BUNKER ACTIVATION:
+  The bulk region object's bunker.status can be STALE (it showed "active"
+  while the bunker was really "pending"). The activation timestamp,
+  `willBeActiveAt`, lives ONLY on the dedicated upgrade endpoint
+  (upgrade.getUpgradeByTypeAndEntity). So for activation we query that
+  per-region endpoint and trust it over the bulk status. `came_online`
+  still keys off the bulk running level and is unchanged.
 """
 
 import argparse
@@ -42,6 +51,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +67,7 @@ HTTP_TIMEOUT   = 30
 MAX_RETRIES    = 3
 RETRY_BACKOFF  = 5     # seconds, multiplied by attempt number
 DISCORD_PAUSE  = 0.6
+UPGRADE_PAUSE  = 0.3   # seconds between per-region bunker-upgrade calls
 USER_AGENT     = "warera-bunker-bot/1.0"
 BOT_USERNAME   = "Bunksby-Bunkerbot"   # overrides whatever the Discord webhook is named
 RUNS_KEEP      = 100   # how many recent runs to retain in runs.json
@@ -114,6 +125,7 @@ COLOR_ORANGE   = 0xfb923c   # ownership flip
 COLOR_PURPLE   = 0xa78bfa   # construction started
 COLOR_PINK     = 0xf472b6   # battle started
 COLOR_TEAL     = 0x2dd4bf   # battle ended
+COLOR_INDIGO   = 0x818cf8   # bunker pending activation
 
 
 # ── Generic helpers ───────────────────────────────────────────────────────
@@ -193,6 +205,28 @@ def fetch_all_regions():
         raise RuntimeError(f"region.getRegionsObject returned unexpected shape: {type(data)}")
     log(f"fetched {len(data)} regions")
     return data
+
+
+def fetch_bunker_upgrade(region_id):
+    """
+    Per-region bunker upgrade detail from the dedicated endpoint. This is the
+    ONLY place willBeActiveAt (the activation timestamp) is exposed; the bulk
+    region object does not carry it and its bunker.status can be stale.
+
+    Best-effort: returns the upgrade dict, or None on any failure (never raises).
+    """
+    payload = json.dumps(
+        {"upgradeType": "bunker", "regionId": region_id},
+        separators=(",", ":"),
+    )
+    url = f"{PROXY_BASE}/upgrade.getUpgradeByTypeAndEntity?input={urllib.parse.quote(payload)}"
+    try:
+        body = http_get_json(url)
+    except Exception as e:
+        log(f"bunker upgrade fetch failed for {region_id} (non-fatal): {e}")
+        return None
+    data = (body or {}).get("result", {}).get("data")
+    return data if isinstance(data, dict) else None
 
 
 # ── State extraction ─────────────────────────────────────────────────────
@@ -286,11 +320,47 @@ def build_current_state(regions, country_id_to_code):
             "country_code":          controller_code,     # who controls it NOW
             "country_id":            country_id,
             "initial_country_id":    initial_country_id,
-            "initial_country_code":  core_code,            # who it belongs to
+            "initial_country_code":  core_code,           # who it belongs to
             "active_battle_id":      extract_active_battle_id(region),
             "bunker":                extract_bunker_state(region),
             "observed_at":           now,
+            # "bunker_upgrade" is added later by collect_bunker_upgrades() for
+            # monitored regions that have a bunker. Absent otherwise.
         }
+    return out
+
+
+def collect_bunker_upgrades(current_state):
+    """
+    For monitored regions that already show a bunker in the bulk snapshot,
+    fetch the dedicated upgrade record so we can read its real `status` and
+    `willBeActiveAt`. Filtering on bulk bunker-presence bounds this to a
+    handful of calls per run. Returns {region_id: {status, will_be_active_at, level}}.
+    """
+    targets = []
+    for rid, st in current_state.items():
+        if origin_country_code(st.get("code")) not in MONITORED_COUNTRY_CODES:
+            continue
+        bunker = st.get("bunker") or {}
+        if bunker.get("built_status") is None:
+            continue  # no bunker built here; nothing to activate
+        targets.append(rid)
+
+    if not targets:
+        return {}
+
+    log(f"querying bunker upgrade detail for {len(targets)} monitored region(s) with bunkers")
+    out = {}
+    for i, rid in enumerate(targets):
+        up = fetch_bunker_upgrade(rid)
+        if isinstance(up, dict):
+            out[rid] = {
+                "status":            up.get("status"),
+                "will_be_active_at": up.get("willBeActiveAt"),
+                "level":             up.get("level"),
+            }
+        if i < len(targets) - 1:
+            time.sleep(UPGRADE_PAUSE)
     return out
 
 
@@ -301,9 +371,11 @@ def detect_transitions(prev, curr):
     Emits one or more events per region when state changes. Bunker
     presence/level changes are mutually exclusive within a region (built
     XOR destroyed XOR running-level transitions), but ownership,
-    construction, and battle events fire independently and can co-occur.
+    construction, battle, and activation events fire independently and can
+    co-occur.
     """
     events = []
+    now = datetime.now(timezone.utc)
 
     for rid in set(prev.keys()) | set(curr.keys()):
         p = prev.get(rid)
@@ -311,7 +383,7 @@ def detect_transitions(prev, curr):
         if p is None or c is None:
             continue  # first observation or vanished
 
-        # Ownership flip (now compares CURRENT controllers, not core owners)
+        # Ownership flip (compares CURRENT controllers, not core owners)
         p_cc = p.get("country_code")
         c_cc = c.get("country_code")
         if p_cc and c_cc and p_cc != c_cc:
@@ -349,6 +421,22 @@ def detect_transitions(prev, curr):
         elif p_bid and not c_bid:
             events.append(_event("battle_ended", rid, p, c))
 
+        # Bunker pending activation (from the dedicated upgrade endpoint).
+        # Fire ONCE per pending episode: when the bunker first becomes pending,
+        # or when its target activation time changes (a new cycle). Keying the
+        # dedupe on willBeActiveAt means the same pending state across multiple
+        # 2h polls won't re-alert, but each new cycle (new timestamp) will.
+        p_up = p.get("bunker_upgrade") or {}
+        c_up = c.get("bunker_upgrade") or {}
+        c_status   = c_up.get("status")
+        c_activeat = c_up.get("will_be_active_at")
+        if c_status == "pending" and c_activeat:
+            dt = parse_iso(c_activeat)
+            if dt and dt > now:  # ignore stale/past timestamps
+                if (p_up.get("status") != "pending"
+                        or p_up.get("will_be_active_at") != c_activeat):
+                    events.append(_event("bunker_activating", rid, p, c))
+
     return events
 
 
@@ -365,6 +453,8 @@ def _event(kind, rid, prev_region, curr_region):
         "initial_country_id":    curr_region.get("initial_country_id"),
         "prev_bunker":           prev_region.get("bunker") or {},
         "curr_bunker":           curr_region.get("bunker") or {},
+        "prev_bunker_upgrade":   prev_region.get("bunker_upgrade") or {},
+        "curr_bunker_upgrade":   curr_region.get("bunker_upgrade") or {},
         "prev_battle_id":        prev_region.get("active_battle_id"),
         "curr_battle_id":        curr_region.get("active_battle_id"),
     }
@@ -396,6 +486,8 @@ _EMBED_META = {
                              "Battle in progress in-game."),
     "battle_ended":         ("🏁", "Battle ended",               COLOR_TEAL,
                              "Battle concluded. Check the outcome in-game."),
+    "bunker_activating":    ("⏳", "Bunker activating soon",      COLOR_INDIGO,
+                             "Scheduled to go active at the listed time."),
 }
 
 
@@ -458,6 +550,19 @@ def format_event_embed(event):
         change_line = "A battle has begun on this region."
     elif kind == "battle_ended":
         change_line = "The active battle has concluded."
+    elif kind == "bunker_activating":
+        up   = event.get("curr_bunker_upgrade") or {}
+        wa   = up.get("will_be_active_at")
+        lvl  = up.get("level")
+        dt   = parse_iso(wa)
+        # Discord renders <t:unix:R> as a live relative countdown and <t:unix:f>
+        # as a localized datetime — auto-converted to each viewer's timezone.
+        lvl_txt = f" Level **L{lvl}**." if isinstance(lvl, int) else ""
+        if dt:
+            unix = int(dt.timestamp())
+            change_line = f"Pending — activates <t:{unix}:R> (<t:{unix}:f>).{lvl_txt}"
+        else:
+            change_line = f"Pending activation.{lvl_txt}"
     else:
         change_line = "Region state changed."
 
@@ -629,7 +734,14 @@ def run_alert():
 
     id_to_code = build_country_id_to_code(regions)
     current    = build_current_state(regions, id_to_code)
-    previous   = load_state()
+
+    # Enrich monitored regions that have a bunker with willBeActiveAt / status
+    # from the dedicated upgrade endpoint (the bulk snapshot lacks it).
+    for rid, up in collect_bunker_upgrades(current).items():
+        if rid in current:
+            current[rid]["bunker_upgrade"] = up
+
+    previous = load_state()
 
     if not previous:
         watched = sorted(MONITORED_COUNTRY_CODES)
@@ -653,7 +765,8 @@ def run_alert():
         priority = {
             "destroyed": 0, "ownership_changed": 1, "went_offline": 2,
             "battle_started": 3, "built": 4, "construction_started": 5,
-            "came_online": 6, "level_changed": 7, "battle_ended": 8,
+            "bunker_activating": 6, "came_online": 7, "level_changed": 8,
+            "battle_ended": 9,
         }
         events.sort(key=lambda e: (
             priority.get(e["type"], 99),
