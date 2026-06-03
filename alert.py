@@ -21,6 +21,8 @@ Events detected:
   battle_started        a battle began on this region
   battle_ended          the active battle finished
   bunker_activating     bunker is pending and will activate at willBeActiveAt
+  resistance_full       occupied region's resistance bar hit max (liberation
+                        battle now available)
 
 We cannot tell *why* a bunker transitioned (oil exhausted, manual disable,
 battle damage). The alert states the change and lets humans investigate.
@@ -43,6 +45,16 @@ NOTE ON BUNKER ACTIVATION:
   (upgrade.getUpgradeByTypeAndEntity). So for activation we query that
   per-region endpoint and trust it over the bulk status. `came_online`
   still keys off the bulk running level and is unchanged.
+
+NOTE ON RESISTANCE:
+  region.resistance     = current resistance bar value (integer)
+  region.resistanceMax  = the cap, which equals development * 100
+  Resistance only climbs while a region is OCCUPIED; owner-controlled regions
+  decay (0.2%/h). When the bar is full a liberation battle can be started, so
+  resistance_full only fires for occupied regions. resistanceMax creeps up with
+  development, so a region pinned at the cap can briefly read one under it; a
+  hysteresis flag (`alerted`) suppresses re-fires until resistance falls back
+  below 90% of max. Both fields live on the bulk snapshot, so no extra calls.
 """
 
 import argparse
@@ -71,6 +83,12 @@ UPGRADE_PAUSE  = 0.3   # seconds between per-region bunker-upgrade calls
 USER_AGENT     = "warera-bunker-bot/1.0"
 BOT_USERNAME   = "Bunksby-Bunkerbot"   # overrides whatever the Discord webhook is named
 RUNS_KEEP      = 100   # how many recent runs to retain in runs.json
+
+# Fraction of resistanceMax that resistance must fall back below before a
+# region that already alerted "full" is allowed to alert again. Stops a region
+# pinned at the cap from re-firing every poll when development creep nudges the
+# max up by a fraction.
+RESISTANCE_REARM_RATIO = 0.9
 
 # If the heartbeat sees the last successful alert run was older than this,
 # it warns the channel that the cron may be stalled.
@@ -126,6 +144,7 @@ COLOR_PURPLE   = 0xa78bfa   # construction started
 COLOR_PINK     = 0xf472b6   # battle started
 COLOR_TEAL     = 0x2dd4bf   # battle ended
 COLOR_INDIGO   = 0x818cf8   # bunker pending activation
+COLOR_CRIMSON  = 0xdc2626   # resistance bar full
 
 
 # ── Generic helpers ───────────────────────────────────────────────────────
@@ -266,6 +285,22 @@ def extract_bunker_state(region):
     }
 
 
+def extract_resistance_state(region):
+    """
+    Current resistance value and its cap (resistanceMax == development * 100).
+    `alerted` is hysteresis state: it defaults False here and is updated by
+    detect_transitions, then persists in state.json so a region pinned at the
+    cap doesn't re-alert every poll.
+    """
+    val = region.get("resistance")
+    mx  = region.get("resistanceMax")
+    return {
+        "value":   val if isinstance(val, (int, float)) else None,
+        "max":     mx if isinstance(mx, (int, float)) else None,
+        "alerted": False,
+    }
+
+
 def extract_active_battle_id(region):
     """activeBattle is sometimes a string id, sometimes the full object."""
     ab = region.get("activeBattle")
@@ -323,6 +358,7 @@ def build_current_state(regions, country_id_to_code):
             "initial_country_code":  core_code,           # who it belongs to
             "active_battle_id":      extract_active_battle_id(region),
             "bunker":                extract_bunker_state(region),
+            "resistance":            extract_resistance_state(region),
             "observed_at":           now,
             # "bunker_upgrade" is added later by collect_bunker_upgrades() for
             # monitored regions that have a bunker. Absent otherwise.
@@ -371,8 +407,11 @@ def detect_transitions(prev, curr):
     Emits one or more events per region when state changes. Bunker
     presence/level changes are mutually exclusive within a region (built
     XOR destroyed XOR running-level transitions), but ownership,
-    construction, battle, and activation events fire independently and can
-    co-occur.
+    construction, battle, activation, and resistance events fire
+    independently and can co-occur.
+
+    Side effect: the resistance arm WRITES the hysteresis `alerted` flag back
+    onto curr's resistance dict so it persists into the next saved state.
     """
     events = []
     now = datetime.now(timezone.utc)
@@ -437,6 +476,39 @@ def detect_transitions(prev, curr):
                         or p_up.get("will_be_active_at") != c_activeat):
                     events.append(_event("bunker_activating", rid, p, c))
 
+        # Resistance bar full (occupied regions only), with hysteresis.
+        # Resistance only climbs while a region is occupied; owner-controlled
+        # regions decay, so we only signal for occupied ones. A full bar lets a
+        # liberation battle be started. resistanceMax creeps up with
+        # development, so a region pinned at the cap can briefly read one under
+        # it; the `alerted` flag suppresses re-fires until resistance falls back
+        # below RESISTANCE_REARM_RATIO of max, giving one alert per cycle. The
+        # flag is written onto c_res so it survives into the next saved state.
+        p_res = p.get("resistance") or {}
+        c_res = c.get("resistance")
+        if isinstance(c_res, dict):
+            c_val = c_res.get("value")
+            c_max = c_res.get("max")
+            occupied = bool(
+                c.get("country_id") and c.get("initial_country_id")
+                and c.get("country_id") != c.get("initial_country_id")
+            )
+            prev_alerted = bool(p_res.get("alerted"))
+
+            if (occupied and isinstance(c_val, (int, float))
+                    and isinstance(c_max, (int, float)) and c_max > 0):
+                if c_val >= c_max and not prev_alerted:
+                    events.append(_event("resistance_full", rid, p, c))
+                    c_res["alerted"] = True
+                elif prev_alerted and c_val < c_max * RESISTANCE_REARM_RATIO:
+                    c_res["alerted"] = False   # re-armed; dropped back below band
+                else:
+                    c_res["alerted"] = prev_alerted   # carry forward
+            else:
+                # Not occupied (liberated, or no data): clear so the next
+                # occupation cycle can fire fresh.
+                c_res["alerted"] = False
+
     return events
 
 
@@ -455,6 +527,8 @@ def _event(kind, rid, prev_region, curr_region):
         "curr_bunker":           curr_region.get("bunker") or {},
         "prev_bunker_upgrade":   prev_region.get("bunker_upgrade") or {},
         "curr_bunker_upgrade":   curr_region.get("bunker_upgrade") or {},
+        "prev_resistance":       prev_region.get("resistance") or {},
+        "curr_resistance":       curr_region.get("resistance") or {},
         "prev_battle_id":        prev_region.get("active_battle_id"),
         "curr_battle_id":        curr_region.get("active_battle_id"),
     }
@@ -488,6 +562,8 @@ _EMBED_META = {
                              "Battle concluded. Check the outcome in-game."),
     "bunker_activating":    ("⏳", "Bunker activating soon",      COLOR_INDIGO,
                              "Scheduled to go active at the listed time."),
+    "resistance_full":      ("🚩", "Resistance bar full",        COLOR_CRIMSON,
+                             "Bar at maximum. A liberation battle can now be started against the occupier."),
 }
 
 
@@ -563,12 +639,30 @@ def format_event_embed(event):
             change_line = f"Pending — activates <t:{unix}:R> (<t:{unix}:f>).{lvl_txt}"
         else:
             change_line = f"Pending activation.{lvl_txt}"
+    elif kind == "resistance_full":
+        rr  = event.get("curr_resistance") or {}
+        val = rr.get("value")
+        mx  = rr.get("max")
+        if isinstance(val, (int, float)) and isinstance(mx, (int, float)):
+            change_line = f"Resistance **{int(val)}/{int(mx)}**, bar is full. Liberation battle available."
+        else:
+            change_line = "Resistance bar is full. Liberation battle available."
     else:
         change_line = "Region state changed."
 
     description = header_line
     if change_line:
         description += f"\n\n{change_line}"
+
+    # Append current resistance context to every alert except resistance_full,
+    # which already leads with the bar. Shown only when we have the numbers.
+    if kind != "resistance_full":
+        rr  = event.get("curr_resistance") or {}
+        val = rr.get("value")
+        mx  = rr.get("max")
+        if isinstance(val, (int, float)) and isinstance(mx, (int, float)) and mx > 0:
+            pct = int(round(val / mx * 100))
+            description += f"\n\nResistance: **{int(val)}/{int(mx)}** ({pct}%)"
 
     title_text = f"{emoji}  {title_label}"
     if len(title_text) > 256:
@@ -757,6 +851,8 @@ def run_alert():
                     "total_events": 0, "monitored_events": 0, "regions": len(current)})
         return 0
 
+    # NOTE: detect_transitions also writes the resistance `alerted` hysteresis
+    # flag back onto `current`, so it must run before save_state(current).
     all_events = detect_transitions(previous, current)
     events     = [e for e in all_events if is_monitored(e)]
     log(f"detected {len(all_events)} transition(s), {len(events)} in monitored countries")
@@ -764,9 +860,9 @@ def run_alert():
     if events:
         priority = {
             "destroyed": 0, "ownership_changed": 1, "went_offline": 2,
-            "battle_started": 3, "built": 4, "construction_started": 5,
-            "bunker_activating": 6, "came_online": 7, "level_changed": 8,
-            "battle_ended": 9,
+            "battle_started": 3, "resistance_full": 3, "built": 4,
+            "construction_started": 5, "bunker_activating": 6,
+            "came_online": 7, "level_changed": 8, "battle_ended": 9,
         }
         events.sort(key=lambda e: (
             priority.get(e["type"], 99),
