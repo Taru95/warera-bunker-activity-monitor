@@ -722,7 +722,7 @@
     "active_battle_id": null,
     "bunker": {
       "built_level": 1,
-      "built_status": "active",
+      "built_status": "disabled",
       "is_under_construction": false,
       "running_level": null
     },
