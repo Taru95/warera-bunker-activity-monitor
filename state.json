@@ -733,8 +733,8 @@
     },
     "bunker_upgrade": {
       "level": 3,
-      "status": "disabled",
-      "will_be_active_at": "2026-06-02T20:59:59.999Z"
+      "status": "active",
+      "will_be_active_at": "2026-06-02T22:59:59.999Z"
     },
     "code": "de-rhine",
     "country_code": "fr",
