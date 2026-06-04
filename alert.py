@@ -106,8 +106,8 @@ MONITORED_COUNTRY_CODES = {
 #   "uk",  # United Kingdom
 #   "pt",  # Portugal
 #   "dk",  # Denmark
-#   "be",  # Belgium
-#   "nl",  # Netherlands (Holland)
+   "be",  # Belgium
+   "nl",  # Netherlands (Holland)
 }
 
 # Country names for display. Unknown codes fall back to uppercase code.
