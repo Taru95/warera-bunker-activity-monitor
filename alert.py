@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 warera-bunker-notifications-discord
-PROXY_BASE = "https://warera-proxy.toie.workers.dev/trpc"
+PROXY_BASE = "https://warera-proxy.itaru-yt.workers.dev/trpc"
 Polls every 2h via GitHub Actions cron. Detects regional events worldwide
 and posts them to Discord. Only fires for regions whose original owner
 (per the immutable region.code prefix) is in MONITORED_COUNTRY_CODES.
