@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 warera-bunker-notifications-discord
-
+PROXY_BASE = "https://warera-proxy.toie.workers.dev/trpc"
 Polls every 2h via GitHub Actions cron. Detects regional events worldwide
 and posts them to Discord. Only fires for regions whose original owner
 (per the immutable region.code prefix) is in MONITORED_COUNTRY_CODES.
@@ -99,15 +99,15 @@ HEARTBEAT_STALE_HOURS = 4
 # watched regardless of current controller.
 MONITORED_COUNTRY_CODES = {
     "de",  # Germany
-    "no",  # Norway
-    "se",  # Sweden
-    "fi",  # Finland
-    "ie",  # Ireland
-    "uk",  # United Kingdom
-    "pt",  # Portugal
-    "dk",  # Denmark
-    "be",  # Belgium
-    "nl",  # Netherlands (Holland)
+#   "no",  # Norway
+#   "se",  # Sweden
+#   "fi",  # Finland
+#   "ie",  # Ireland
+#   "uk",  # United Kingdom
+#   "pt",  # Portugal
+#   "dk",  # Denmark
+#   "be",  # Belgium
+#   "nl",  # Netherlands (Holland)
 }
 
 # Country names for display. Unknown codes fall back to uppercase code.
