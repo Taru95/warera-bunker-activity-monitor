@@ -273,5 +273,12 @@
     "total_events": 17,
     "monitored_events": 1,
     "regions": 726
+  },
+  {
+    "at": "2026-06-09T11:14:07.704683+00:00",
+    "success": true,
+    "total_events": 45,
+    "monitored_events": 1,
+    "regions": 726
   }
 ]
